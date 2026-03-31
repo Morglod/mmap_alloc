@@ -55,6 +55,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <errno.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -68,6 +69,11 @@ DWORD WINAPI DiscardVirtualMemory(PVOID VirtualAddress, SIZE_T Size);
 #include <sys/resource.h>
 #include <fcntl.h>
 #include <unistd.h>
+/* MADV_PAGEOUT actively pages dirty MAP_SHARED pages to the backing file (Linux 5.4+).
+   Fall back to MADV_DONTNEED on older kernels — handled at runtime via errno. */
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
 #endif
 
 /* ── Constants ── */
@@ -237,14 +243,20 @@ static void platform_file_create(void) {
     );
 }
 
-static void platform_file_extend(size_t new_size) {
+static int platform_file_extend(size_t new_size) {
     if (new_size > backing_file_size) {
         LARGE_INTEGER li;
         li.QuadPart = (LONGLONG)new_size;
-        SetFilePointerEx(backing_handle, li, NULL, FILE_BEGIN);
-        SetEndOfFile(backing_handle);
+        if (!SetFilePointerEx(backing_handle, li, NULL, FILE_BEGIN) ||
+            !SetEndOfFile(backing_handle)) {
+            fprintf(stderr, "mmap_alloc: cannot grow backing file to %.3f GB (error %lu)\n",
+                    (double)new_size / (1024.0 * 1024.0 * 1024.0), GetLastError());
+            fflush(stderr);
+            abort();
+        }
         backing_file_size = new_size;
     }
+    return 0;
 }
 
 static void* platform_chunk_map(size_t offset, size_t size) {
@@ -301,11 +313,25 @@ static void platform_file_create(void) {
     backing_path[0] = '\0';
 }
 
-static void platform_file_extend(size_t new_size) {
+static int platform_file_extend(size_t new_size) {
     if (new_size > backing_file_size) {
-        ftruncate(backing_fd, (off_t)new_size);
+        /* posix_fallocate actually reserves pages on the filesystem (including
+           tmpfs), so it returns ENOSPC immediately when /tmp is full.
+           ftruncate only sets file size metadata and succeeds even when there
+           is no space; the real failure then arrives as SIGBUS on first page
+           write, killing the process silently before any error can be printed. */
+        int ret = posix_fallocate(backing_fd, (off_t)backing_file_size,
+                                  (off_t)(new_size - backing_file_size));
+        if (ret != 0) {
+            /* posix_fallocate returns the error code directly, not via errno */
+            fprintf(stderr, "mmap_alloc: cannot grow backing file to %.3f GB: %s\n",
+                    (double)new_size / (1024.0 * 1024.0 * 1024.0), strerror(ret));
+            fflush(stderr);
+            abort();
+        }
         backing_file_size = new_size;
     }
+    return 0;
 }
 
 static void* platform_chunk_map(size_t offset, size_t size) {
@@ -345,7 +371,7 @@ static int map_new_chunk(size_t size, int oversized) {
                     (double)max_file_size / (1024.0 * 1024.0 * 1024.0));
             return -1;
         }
-        platform_file_extend(file_offset + mapped_size);
+        if (platform_file_extend(file_offset + mapped_size) < 0) return -1;
     }
 
     void* base = platform_chunk_map(file_offset, mapped_size);
@@ -443,6 +469,8 @@ static void init_allocator(void) {
 #else
         /* Note: modern Linux kernels largely ignore RLIMIT_RSS.
            For strict enforcement, use cgroups (memory.max) externally. */
+        printf("mmap_alloc: RLIMIT_RSS works only on Linux <= 2.6.\n");
+        printf("mmap_alloc: Instead use this: systemd-run --scope -p MemoryMax=8G -- bash -c \"your_app_here\"\n");
         {
             struct rlimit rl;
             getrlimit(RLIMIT_RSS, &rl);
@@ -518,6 +546,20 @@ void* malloc(size_t size) {
 
     size_t aligned_off = align_up(current_offset, ALIGN);
     if (active_chunk < 0 || aligned_off + sizeof(AllocHeader) + size > CHUNK_SIZE) {
+#ifndef _WIN32
+        /* Page out the unused tail of the retiring active chunk so the OS can
+           reclaim those physical pages back to the file immediately. */
+        if (active_chunk >= 0) {
+            uintptr_t tail_start = ((uintptr_t)chunks[active_chunk].base + current_offset
+                                    + MMAP_PAGE_SIZE - 1)
+                                   & ~((uintptr_t)(MMAP_PAGE_SIZE - 1));
+            uintptr_t tail_end   = (uintptr_t)chunks[active_chunk].base + CHUNK_SIZE;
+            if (tail_end > tail_start) {
+                if (madvise((void*)tail_start, tail_end - tail_start, MADV_PAGEOUT) < 0)
+                    madvise((void*)tail_start, tail_end - tail_start, MADV_DONTNEED);
+            }
+        }
+#endif
         int idx = map_new_chunk(CHUNK_SIZE, 0);
         if (idx < 0) return NULL;
         active_chunk = idx;
@@ -564,8 +606,13 @@ void free(void* ptr) {
         FreeBlock* fb = (FreeBlock*)ptr;
         fb->next = free_list_head;
         free_list_head = fb;
-        /* Hint OS to drop interior pages from RAM (best-effort, errors ignored) */
-        if ((size_t)hdr->size >= MMAP_PAGE_SIZE) {
+        /* Hint OS to page out interior pages to the backing file (best-effort).
+           MADV_PAGEOUT (Linux 5.4+) actively evicts dirty MAP_SHARED pages to
+           the file. Fall back to MADV_DONTNEED on older kernels.
+           The outer size guard is intentionally removed: the math already
+           produces an empty range for sub-page blocks, so the madvise is a
+           no-op for small allocations without needing an explicit branch. */
+        {
             uintptr_t start = ((uintptr_t)ptr + sizeof(FreeBlock) + MMAP_PAGE_SIZE - 1)
                               & ~((uintptr_t)(MMAP_PAGE_SIZE - 1));
             uintptr_t end = ((uintptr_t)ptr + (size_t)hdr->size)
@@ -574,7 +621,8 @@ void free(void* ptr) {
 #ifdef _WIN32
                 DiscardVirtualMemory((void*)start, end - start);
 #else
-                madvise((void*)start, end - start, MADV_DONTNEED);
+                if (madvise((void*)start, end - start, MADV_PAGEOUT) < 0)
+                    madvise((void*)start, end - start, MADV_DONTNEED);
 #endif
             }
         }
